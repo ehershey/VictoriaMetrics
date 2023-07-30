@@ -1,10 +1,13 @@
 package remotewrite
 
 import (
+	"cloud.google.com/go/pubsub"
+	"context"
 	"flag"
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -80,6 +83,9 @@ var (
 		"are written to the corresponding -remoteWrite.url . See also -remoteWrite.streamAggr.keepInput and https://docs.victoriametrics.com/stream-aggregation.html")
 	streamAggrDedupInterval = flagutil.NewArrayDuration("remoteWrite.streamAggr.dedupInterval", "Input samples are de-duplicated with this interval before being aggregated. "+
 		"Only the last sample per each time series per each interval is aggregated if the interval is greater than zero")
+
+	gcpPubsubPushTopic = flag.String("gcp.pubsub.publish.projectId", "", "GCP pubsub topic full name to push metrics to. "+
+		"Like: projects/my-project/topics/my-topic")
 )
 
 var (
@@ -122,10 +128,11 @@ func InitSecretFlags() {
 //
 // Stop must be called for graceful shutdown.
 func Init() {
-	if len(*remoteWriteURLs) == 0 && len(*remoteWriteMultitenantURLs) == 0 {
-		logger.Fatalf("at least one `-remoteWrite.url` or `-remoteWrite.multitenantURL` command-line flag must be set")
+	if len(*remoteWriteURLs) == 0 && len(*remoteWriteMultitenantURLs) == 0 && len(*gcpPubsubPushTopic) == 0 {
+		logger.Fatalf("at least one `-remoteWrite.url` or `-remoteWrite.multitenantURL` or `-gcp.pubsub.publish.projectId` command-line flag must be set")
 	}
 	if len(*remoteWriteURLs) > 0 && len(*remoteWriteMultitenantURLs) > 0 {
+		// gcp.push can be used together with remoteWrite
 		logger.Fatalf("cannot set both `-remoteWrite.url` and `-remoteWrite.multitenantURL` command-line flags")
 	}
 	if *maxHourlySeries > 0 {
@@ -185,6 +192,52 @@ func Init() {
 			reloadStreamAggrConfigs()
 		}
 	}()
+}
+
+func doPubsub() (err error) {
+	matched := regexp.MustCompile("projects/(.+?)/topics/(.+)").FindStringSubmatch(*gcpPubsubPushTopic)
+	if len(matched) == 0 {
+		return fmt.Errorf("-gcp.pubsub.push.topic is not in format projects/<project-id>/topics/<topic-name>: %s", *gcpPubsubPushTopic)
+	}
+
+	project := matched[1]
+	topic := matched[2]
+
+	ctx := context.Background()
+	pubsubClient, err := pubsub.NewClient(ctx, project)
+	if err != nil {
+		return fmt.Errorf("cannot create new GCP PubSub client: %w", err)
+	}
+	defer pubsubClient.Close()
+
+	t := pubsubClient.TopicInProject(topic, project)
+	// Default pubsub settings we may want to tweak
+	t.PublishSettings = pubsub.PublishSettings{
+		DelayThreshold: 10 * time.Millisecond,
+		CountThreshold: 100,
+		ByteThreshold:  1e6,
+		Timeout:        60 * time.Second,
+		// By default, limit the bundler to 10 times the max message size. The number 10 is
+		// chosen as a reasonable amount of messages in the worst case whilst still
+		// capping the number to a low enough value to not OOM users.
+		FlowControlSettings: pubsub.FlowControlSettings{
+			MaxOutstandingMessages: 1000,
+			MaxOutstandingBytes:    -1,
+			LimitExceededBehavior:  pubsub.FlowControlIgnore,
+		},
+	}
+
+	result := t.Publish(ctx, &pubsub.Message{
+		Data: []byte("test"),
+	})
+	// Block until the result is returned and a server-generated
+	// ID is returned for the published message.
+	id, err := result.Get(ctx)
+	if err != nil {
+		return fmt.Errorf("pubsub: result.Get: %w", err)
+	}
+	fmt.Printf("Published a message; msg ID: %v\n", id)
+	return nil
 }
 
 func reloadRelabelConfigs() {

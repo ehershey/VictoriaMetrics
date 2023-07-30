@@ -3,6 +3,7 @@ module github.com/VictoriaMetrics/VictoriaMetrics
 go 1.19
 
 require (
+	cloud.google.com/go/pubsub v1.33.0
 	cloud.google.com/go/storage v1.31.0
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.7.0
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.1.0
